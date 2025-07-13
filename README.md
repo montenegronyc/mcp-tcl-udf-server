@@ -1,12 +1,53 @@
 # TCL MCP Server with Namespace Support
 
-A Model Context Protocol (MCP) server that provides TCL (Tool Command Language) execution capabilities with namespace-based tool management and versioning.
+A Model Context Protocol (MCP) server that provides TCL (Tool Command Language) execution capabilities with namespace-based tool management and versioning. Supports multiple TCL runtime implementations including Molt (safe subset) and the official TCL interpreter.
 
-This currently uses the Molt engine which provides a limited subset of TCL that is slightly safer than an official TCL integration.
+**Caution this is "vibe coded" and allows for autonomous AI development and execution on target systems. Use with caution)**
 
-Coming soon: Build-time support for a full TCL interpreter.
+## TCL Runtime Support
 
-(Caution this is "vibe coded" and allows for autonomous AI development and execution on target systems. Use with caution)
+This server supports multiple TCL runtime implementations with intelligent capability reporting and MCP integration:
+
+- **Molt** (default): A safe, embedded TCL interpreter written in Rust. Provides a subset of TCL functionality with memory safety.
+- **TCL** (optional): The official TCL interpreter via Rust bindings. Provides full TCL functionality.
+
+### Runtime Selection
+
+```bash
+# Choose runtime via CLI argument
+tcl-mcp-server --runtime molt --privileged
+tcl-mcp-server --runtime tcl --privileged
+
+# Choose runtime via environment variable
+export TCL_MCP_RUNTIME=molt
+tcl-mcp-server --privileged
+
+# Priority: CLI args > Environment > Smart defaults (prefers Molt for safety)
+```
+
+**IMPORTANT NOTE**: Wrapper scripts with integrated defaults
+
+Normally, you can simply use `tcl-mcp-server-admin` manually or by an agent swarm orchestrator. Worker agents may either use the `tcl-mcp-server-admin` (privileged), or for safety, `tcl-mcp-server` (non-privileged)
+
+The following scripts default to the settings as indicated by name:
+
+* tcl-mcp-server-ctcl
+* tcl-mcp-server-admin-ctcl
+* tcl-mcp-server-molt
+* tcl-mcp-server-admin-molt
+
+### Building with Different Runtimes
+
+```bash
+# Default build with Molt (recommended)
+cargo build --release
+
+# Build with official TCL interpreter (requires TCL installed on system)
+cargo build --release --no-default-features --features tcl
+
+# Build with both runtimes for maximum flexibility
+cargo build --release --features molt,tcl
+```
 
 ## Overview
 
@@ -189,9 +230,44 @@ Access Molt TCL interpreter documentation and examples (path: `/docs/molt_book`)
 - `examples` - Practical TCL code examples
 - `links` - Links to official Molt documentation and resources
 
+### Runtime Capability Queries
+
+LLMs can query runtime capabilities for intelligent code generation:
+
+```json
+{
+  "tool": "tcl_runtime_info",
+  "parameters": {
+    "include_examples": true,
+    "category_filter": "safe"
+  }
+}
+```
+
+**Response for Molt Runtime:**
+```json
+{
+  "runtime_name": "Molt",
+  "features": ["safe_subset", "memory_safe", "no_file_io"],
+  "limitations": ["No file I/O operations", "No system commands"],
+  "command_categories": {
+    "core": ["set", "expr", "if", "while", "proc"],
+    "string": ["string", "format", "regexp"],
+    "list": ["list", "lappend", "llength"]
+  },
+  "examples": [
+    {
+      "category": "arithmetic",
+      "prompt": "Calculate the area of a circle with radius 5",
+      "code": "set radius 5\nset pi 3.14159\nexpr {$pi * $radius * $radius}"
+    }
+  ]
+}
+```
+
 ### Custom Tool Example
 
-1. **Add a tool to your namespace:**
+1. **Add a runtime-aware tool:**
 ```json
 {
   "tool": "sbin___tcl_tool_add",
@@ -199,8 +275,8 @@ Access Molt TCL interpreter documentation and examples (path: `/docs/molt_book`)
     "user": "myuser",
     "package": "text",
     "name": "word_count",
-    "version": "1.0",
-    "description": "Count words in text",
+    "version": "1.0", 
+    "description": "Count words in text (Safe for Molt runtime)",
     "script": "return [llength [split $text]]",
     "parameters": [{
       "name": "text",
@@ -212,7 +288,7 @@ Access Molt TCL interpreter documentation and examples (path: `/docs/molt_book`)
 }
 ```
 
-2. **Use the tool (MCP name):**
+2. **Use the tool with runtime context:**
 ```json
 {
   "tool": "user_myuser__text___word_count__v1_0",
@@ -222,7 +298,7 @@ Access Molt TCL interpreter documentation and examples (path: `/docs/molt_book`)
 }
 ```
 
-Result: `4`
+Result: `4` (works safely in both Molt and full TCL)
 
 ## Architecture
 
@@ -264,30 +340,88 @@ Result: `4`
 - Consider running in a container or sandbox for production use
 - Always validate input when accepting TCL scripts from untrusted sources
 
-## MCP Configuration
+## MCP Configuration & Integration
 
 ### Claude Desktop Integration
 
 Add to your Claude Desktop `settings.json`:
 
-**Restricted Mode (Recommended):**
+**Safe Mode with Molt (Recommended):**
 ```json
 {
   "mcpServers": {
-    "tcl": {
-      "command": "/path/to/tcl-mcp/target/release/tcl-mcp-server"
+    "tcl-safe": {
+      "command": "/path/to/tcl-mcp/target/release/tcl-mcp-server",
+      "args": ["--runtime", "molt", "--privileged"],
+      "env": {
+        "TCL_MCP_RUNTIME": "molt",
+        "RUST_LOG": "info"
+      }
     }
   }
 }
 ```
 
-**Privileged Mode (Admin):**
+**Full TCL Runtime (Advanced):**
 ```json
 {
   "mcpServers": {
-    "tcl-admin": {
-      "command": "/path/to/tcl-mcp/target/release/tcl-mcp-server-admin"
+    "tcl-full": {
+      "command": "/path/to/tcl-mcp/target/release/tcl-mcp-server",
+      "args": ["--runtime", "tcl", "--privileged"],
+      "env": {
+        "TCL_MCP_RUNTIME": "tcl",
+        "RUST_LOG": "info"
+      }
     }
+  }
+}
+```
+
+### MCP Tool Properties & Example Prompts
+
+The server provides rich MCP metadata including runtime-aware example prompts:
+
+```json
+{
+  "name": "bin___tcl_execute",
+  "description": "Execute TCL scripts (Runtime: Molt, Safety: Sandboxed)",
+  "metadata": {
+    "runtime_context": {
+      "active_runtime": "Molt",
+      "safety_level": "safe",
+      "available_features": ["core", "string", "list", "math"],
+      "limitations": ["no_file_io", "no_system_commands"]
+    },
+    "example_prompts": [
+      {
+        "category": "arithmetic",
+        "prompt": "Calculate compound interest: principal=1000, rate=0.05, time=3",
+        "code": "set principal 1000\nset rate 0.05\nset time 3\nexpr {$principal * pow(1 + $rate, $time)}",
+        "expected_output": "1157.625"
+      },
+      {
+        "category": "string_processing",
+        "prompt": "Extract domain from email 'user@example.com'",
+        "code": "set email \"user@example.com\"\nset parts [split $email \"@\"]\nlindex $parts 1",
+        "expected_output": "example.com"
+      },
+      {
+        "category": "data_structures", 
+        "prompt": "Create a key-value store and lookup a value",
+        "code": "array set store {name John age 30}\nset store(name)",
+        "expected_output": "John"
+      }
+    ],
+    "limitation_examples": [
+      {
+        "forbidden_operation": "file_read",
+        "forbidden_code": "set fp [open \"file.txt\" r]",
+        "why_forbidden": "Molt runtime doesn't support file I/O",
+        "safe_alternative": "set data \"embedded content here\"",
+        "alternative_explanation": "Use embedded strings instead of file operations"
+      }
+    ]
   }
 }
 ```
@@ -335,18 +469,55 @@ For privileged mode container:
 CMD ["/usr/bin/tcl-mcp-server-admin"]
 ```
 
-## LLM Compatibility
+## LLM Integration & Smart Code Generation
 
-The namespace system is designed to be LLM-friendly:
-- Tool names follow a consistent pattern
-- Namespace paths provide semantic organization
-- Version information is preserved in the MCP name
-- Descriptions include the full path for clarity
+The server is designed for intelligent LLM integration with runtime-aware capabilities:
 
-When tools are listed, they include both the MCP name and the namespace path:
+### Automatic Capability Detection
+LLMs can query runtime capabilities and adapt code generation:
+
+```python
+# LLM workflow example
+capabilities = await mcp.call_tool("tcl_runtime_info")
+
+if "file_io" in capabilities["limitations"]:
+    # Generate safe code for Molt
+    code = "set data \"embedded content\"\nprocessing..."
+else:
+    # Generate full-featured code for TCL
+    code = "set fp [open file.txt r]\nset data [read $fp]\nclose $fp"
+```
+
+### Context-Aware Error Messages
+When operations aren't supported, the server provides helpful alternatives:
+
+```json
+{
+  "error": "File operations not available in Molt runtime",
+  "alternatives": [
+    "Use embedded data instead of file reading",
+    "Switch to full TCL runtime with --runtime tcl",
+    "Process data passed as script parameters"
+  ],
+  "example_alternative": "set data \"embedded content\" # instead of: set fp [open file.txt r]"
+}
+```
+
+### Runtime Comparison for LLMs
+
+| Feature | Molt Runtime | TCL Runtime |
+|---------|-------------|--------------|
+| **Safety** | ✅ Sandboxed, memory-safe | ⚠️ Full system access |
+| **File I/O** | ❌ Not supported | ✅ Full file operations |
+| **System Commands** | ❌ Blocked | ✅ exec, system integration |
+| **Networking** | ❌ Not available | ✅ Socket operations |
+| **Best For** | Data processing, algorithms | System administration, file processing |
+
+### Tool Name Patterns
+Tool names follow a consistent LLM-friendly pattern:
 ```
 "name": "user_alice__utils___reverse_string__v1_0",
-"description": "Reverse a string [/alice/utils/reverse_string:1.0]"
+"description": "Reverse a string [/alice/utils/reverse_string:1.0] (Runtime: Molt, Safe: ✅)"
 ```
 
 ## License

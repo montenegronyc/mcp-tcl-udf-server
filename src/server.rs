@@ -8,6 +8,7 @@ use tracing::{info, debug};
 use crate::tcl_tools::{TclToolBox, TclExecuteRequest, TclToolAddRequest, TclToolRemoveRequest, TclToolListRequest, TclExecToolRequest};
 use crate::tcl_executor::TclExecutor;
 use crate::namespace::ToolPath;
+use crate::tcl_runtime::RuntimeConfig;
 
 #[derive(Clone)]
 pub struct TclMcpServer {
@@ -547,6 +548,336 @@ For Molt-specific capabilities and limitations, refer to the Molt Book."#)),
         });
         
         Self { tool_box, handler }
+    }
+    
+    pub fn new_with_runtime(privileged: bool, runtime_config: RuntimeConfig) -> Result<Self, String> {
+        // Spawn the TCL executor with privilege and runtime settings
+        let executor = TclExecutor::spawn_with_runtime(privileged, runtime_config)?;
+        let tool_box = TclToolBox::new(executor);
+        let mut handler = IoHandler::new();
+        
+        // Register MCP methods
+        handler.add_sync_method("initialize", move |_params: Params| {
+            info!("MCP initialize called");
+            Ok(json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": {}
+                },
+                "serverInfo": {
+                    "name": "tcl-mcp-server",
+                    "version": "1.0.0"
+                }
+            }))
+        });
+        
+        let tb = tool_box.clone();
+        let is_privileged = privileged;
+        handler.add_sync_method("tools/list", move |_params: Params| {
+            debug!("MCP tools/list called (privileged: {})", is_privileged);
+            let tb = tb.clone();
+            
+            // Don't use async block here since we're in a sync context
+            let mut tools = vec![];
+            
+            // In privileged mode, show tool management tools
+            if is_privileged {
+                let system_tools = vec![
+                    (ToolPath::bin("tcl_execute"), "Execute TCL scripts", json!({
+                        "type": "object",
+                        "properties": {
+                            "script": {
+                                "type": "string", 
+                                "description": "The TCL script to execute"
+                            }
+                        },
+                        "required": ["script"]
+                    })),
+                    (ToolPath::sbin("tcl_tool_add"), "Add custom TCL tool", json!({
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Tool path (e.g., user/my_tool)"
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": "Tool description"
+                            },
+                            "script": {
+                                "type": "string",
+                                "description": "TCL script for the tool"
+                            },
+                            "parameters": {
+                                "type": "string",
+                                "description": "JSON array of parameter definitions"
+                            }
+                        },
+                        "required": ["path", "description", "script"]
+                    })),
+                    (ToolPath::sbin("tcl_tool_remove"), "Remove custom TCL tool", json!({
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Tool path to remove (e.g., user/my_tool)"
+                            }
+                        },
+                        "required": ["path"]
+                    })),
+                    (ToolPath::bin("tcl_tool_list"), "List available tools", json!({
+                        "type": "object",
+                        "properties": {
+                            "namespace": {
+                                "type": "string", 
+                                "description": "Optional namespace filter"
+                            },
+                            "filter": {
+                                "type": "string",
+                                "description": "Optional name filter"
+                            }
+                        }
+                    })),
+                    (ToolPath::bin("exec_tool"), "Execute a tool by path", json!({
+                        "type": "object",
+                        "properties": {
+                            "tool_path": {
+                                "type": "string",
+                                "description": "Path to the tool (e.g., bin/tcl_execute)"
+                            },
+                            "params": {
+                                "type": "object",
+                                "description": "Parameters for the tool"
+                            }
+                        },
+                        "required": ["tool_path"]
+                    })),
+                    (ToolPath::bin("discover_tools"), "Discover tools from filesystem", json!({
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Optional path to search for tools"
+                            }
+                        }
+                    })),
+                    (ToolPath::bin("runtime_info"), "Get runtime information", json!({
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    })),
+                ];
+                
+                for (path, description, schema) in system_tools {
+                    tools.push(McpToolInfo {
+                        name: path.to_mcp_name(),
+                        description: Some(format!("{} [{}]", description, path)),
+                        input_schema: schema,
+                    });
+                }
+            } else {
+                // In non-privileged mode, only show safe tools
+                let system_tools = vec![
+                    (ToolPath::bin("tcl_execute"), "Execute safe TCL scripts", json!({
+                        "type": "object",
+                        "properties": {
+                            "script": {
+                                "type": "string", 
+                                "description": "The TCL script to execute (restricted mode)"
+                            }
+                        },
+                        "required": ["script"]
+                    })),
+                    (ToolPath::bin("tcl_tool_list"), "List available tools", json!({
+                        "type": "object",
+                        "properties": {
+                            "namespace": {
+                                "type": "string", 
+                                "description": "Optional namespace filter"
+                            },
+                            "filter": {
+                                "type": "string",
+                                "description": "Optional name filter"
+                            }
+                        }
+                    })),
+                    (ToolPath::bin("runtime_info"), "Get runtime information", json!({
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    })),
+                ];
+                
+                for (path, description, schema) in system_tools {
+                    tools.push(McpToolInfo {
+                        name: path.to_mcp_name(),
+                        description: Some(format!("{} [{}]", description, path)),
+                        input_schema: schema,
+                    });
+                }
+            }
+                
+            // Get custom tools synchronously - this should be fast
+            let custom_tools = match std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(tb.get_tool_definitions())
+            }).join() {
+                Ok(result) => result,
+                Err(_) => {
+                    return Err(jsonrpc_core::Error::internal_error());
+                }
+            };
+            
+            // Add custom tools to the list
+            if let Ok(tool_defs) = custom_tools {
+                for tool_def in tool_defs {
+                    // Build input schema for custom tool
+                    let mut properties = serde_json::Map::new();
+                    let mut required = Vec::new();
+                    
+                    for param in &tool_def.parameters {
+                        // Validate and normalize JSON Schema type
+                        let json_type = match param.type_name.to_lowercase().as_str() {
+                            "string" | "str" | "text" => "string",
+                            "number" | "float" | "double" | "real" => "number",
+                            "integer" | "int" | "long" => "integer", 
+                            "boolean" | "bool" => "boolean",
+                            "array" | "list" => "array",
+                            "object" | "dict" | "map" => "object",
+                            "null" | "nil" | "none" => "null",
+                            // Default to string for unknown types to maintain compatibility
+                            _ => "string"
+                        };
+                        
+                        properties.insert(
+                            param.name.clone(),
+                            json!({
+                                "type": json_type,
+                                "description": param.description,
+                            }),
+                        );
+                        
+                        if param.required {
+                            required.push(param.name.clone());
+                        }
+                    }
+                    
+                    tools.push(McpToolInfo {
+                        name: tool_def.path.to_mcp_name(),
+                        description: Some(format!("{} [{}]", tool_def.description, tool_def.path)),
+                        input_schema: json!({
+                            "type": "object",
+                            "properties": properties,
+                            "required": required
+                        }),
+                    });
+                }
+            }
+            
+            Ok(json!(McpListToolsResult { tools }))
+        });
+        
+        let tb2 = tool_box.clone();
+        handler.add_sync_method("tools/call", move |params: Params| {
+            debug!("MCP tools/call called");
+            let tb = tb2.clone();
+            
+            let call_params: McpCallToolParams = params.parse()?;
+            
+            // Parse tool path from MCP name
+            let tool_path = match ToolPath::from_mcp_name(&call_params.name) {
+                Ok(path) => path,
+                Err(_) => {
+                    return Err(jsonrpc_core::Error::invalid_params("Invalid tool name"));
+                }
+            };
+            
+            // Special handling for runtime_info tool
+            if tool_path.to_mcp_name() == "runtime_info" {
+                // This is a synchronous operation that provides runtime information
+                let info = json!({
+                    "runtime": "selected at startup",
+                    "available_runtimes": crate::tcl_runtime::get_available_runtimes()
+                        .iter()
+                        .map(|r| r.as_str())
+                        .collect::<Vec<_>>(),
+                    "privileged": is_privileged
+                });
+                
+                return Ok(json!(McpCallToolResult {
+                    content: vec![McpContent::Text { 
+                        text: serde_json::to_string_pretty(&info).unwrap_or_else(|_| "Runtime info unavailable".to_string())
+                    }]
+                }));
+            }
+            
+            // Execute tool synchronously in a blocking manner
+            let result = std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    // Handle different tool types
+                    match tool_path.to_mcp_name().as_str() {
+                        "tcl_execute" => {
+                            let req: TclExecuteRequest = serde_json::from_value(call_params.arguments)?;
+                            tb.tcl_execute(req).await
+                        }
+                        "tcl_tool_add" => {
+                            if !is_privileged {
+                                return Err(anyhow::anyhow!("Tool management requires privileged mode"));
+                            }
+                            let req: TclToolAddRequest = serde_json::from_value(call_params.arguments)?;
+                            tb.tcl_tool_add(req).await
+                        }
+                        "tcl_tool_remove" => {
+                            if !is_privileged {
+                                return Err(anyhow::anyhow!("Tool management requires privileged mode"));
+                            }
+                            let req: TclToolRemoveRequest = serde_json::from_value(call_params.arguments)?;
+                            tb.tcl_tool_remove(req).await
+                        }
+                        "tcl_tool_list" => {
+                            let req: TclToolListRequest = serde_json::from_value(call_params.arguments)?;
+                            tb.tcl_tool_list(req).await
+                        }
+                        "exec_tool" => {
+                            if !is_privileged {
+                                return Err(anyhow::anyhow!("Tool execution requires privileged mode"));
+                            }
+                            let req: TclExecToolRequest = serde_json::from_value(call_params.arguments)?;
+                            tb.exec_tool(req).await
+                        }
+                        "discover_tools" => {
+                            if !is_privileged {
+                                return Err(anyhow::anyhow!("Tool discovery requires privileged mode"));
+                            }
+                            tb.discover_tools().await
+                        }
+                        _ => {
+                            // Try to execute as custom tool
+                            tb.execute_custom_tool(&tool_path.to_mcp_name(), call_params.arguments).await
+                        }
+                    }
+                })
+            }).join();
+            
+            match result {
+                Ok(Ok(output)) => {
+                    Ok(json!(McpCallToolResult {
+                        content: vec![McpContent::Text { text: output }]
+                    }))
+                }
+                Ok(Err(e)) => {
+                    let mut error = jsonrpc_core::Error::internal_error();
+                    error.message = format!("Tool execution failed: {}", e);
+                    Err(error)
+                }
+                Err(_) => {
+                    Err(jsonrpc_core::Error::internal_error())
+                }
+            }
+        });
+        
+        Ok(Self { tool_box, handler })
     }
     
     /// Initialize persistence for tool storage

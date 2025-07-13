@@ -1,5 +1,4 @@
 use anyhow::{Result, anyhow};
-use molt::Interp;
 use tokio::sync::{mpsc, oneshot};
 use std::collections::HashMap;
 use std::thread;
@@ -8,6 +7,7 @@ use crate::tcl_tools::{ToolDefinition, ParameterDefinition};
 use crate::namespace::{ToolPath, Namespace};
 use crate::persistence::FilePersistence;
 use crate::tool_discovery::{ToolDiscovery, DiscoveredTool};
+use crate::tcl_runtime::{TclRuntime, create_runtime, RuntimeConfig};
 
 pub enum TclCommand {
     Execute {
@@ -52,7 +52,7 @@ pub enum TclCommand {
 }
 
 pub struct TclExecutor {
-    interp: Interp,
+    runtime: Box<dyn TclRuntime>,
     custom_tools: HashMap<ToolPath, ToolDefinition>,
     discovered_tools: HashMap<ToolPath, DiscoveredTool>,
     tool_discovery: ToolDiscovery,
@@ -61,22 +61,45 @@ pub struct TclExecutor {
 
 impl TclExecutor {
     pub fn new(privileged: bool) -> Self {
-        let interp = Interp::new();
+        let runtime = create_runtime();
         
         // In non-privileged mode, we could disable certain commands here
         // For now, we'll just store the flag and use it during execution
         if !privileged {
             // TODO: Consider filtering dangerous commands like 'exec', 'file', etc.
-            // For now, we rely on Molt's default safety features
+            // For now, we rely on the runtime's default safety features
         }
         
+        tracing::info!("Initialized TCL runtime: {}", runtime.name());
+        
         Self {
-            interp,
+            runtime,
             custom_tools: HashMap::new(),
             discovered_tools: HashMap::new(),
             tool_discovery: ToolDiscovery::new(),
             persistence: None,
         }
+    }
+    
+    pub fn new_with_runtime(privileged: bool, _runtime_config: RuntimeConfig) -> Result<Self, String> {
+        let runtime = create_runtime();
+        
+        // In non-privileged mode, we could disable certain commands here
+        // For now, we'll just store the flag and use it during execution
+        if !privileged {
+            // TODO: Consider filtering dangerous commands like 'exec', 'file', etc.
+            // For now, we rely on the runtime's default safety features
+        }
+        
+        tracing::info!("Initialized TCL runtime: {}", runtime.name());
+        
+        Ok(Self {
+            runtime,
+            custom_tools: HashMap::new(),
+            discovered_tools: HashMap::new(),
+            tool_discovery: ToolDiscovery::new(),
+            persistence: None,
+        })
     }
     
     pub fn spawn(privileged: bool) -> mpsc::Sender<TclCommand> {
@@ -139,11 +162,75 @@ impl TclExecutor {
         tx
     }
     
+    pub fn spawn_with_runtime(privileged: bool, runtime_config: RuntimeConfig) -> Result<mpsc::Sender<TclCommand>, String> {
+        let (tx, mut rx) = mpsc::channel::<TclCommand>(100);
+        
+        // Spawn a dedicated thread for the TCL interpreter
+        let tx_clone = tx.clone();
+        thread::spawn(move || {
+            let mut executor = match TclExecutor::new_with_runtime(privileged, runtime_config) {
+                Ok(executor) => executor,
+                Err(e) => {
+                    tracing::error!("Failed to create TCL executor: {}", e);
+                    return;
+                }
+            };
+            
+            // Create a single-threaded runtime for this thread
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create Tokio runtime");
+                
+            runtime.block_on(async move {
+                while let Some(cmd) = rx.recv().await {
+                    match cmd {
+                        TclCommand::Execute { script, response } => {
+                            let result = executor.execute_script(&script);
+                            let _ = response.send(result);
+                        }
+                        TclCommand::AddTool { path, description, script, parameters, response } => {
+                            let result = executor.add_tool(path, description, script, parameters).await;
+                            let _ = response.send(result);
+                        }
+                        TclCommand::RemoveTool { path, response } => {
+                            let result = executor.remove_tool(&path).await;
+                            let _ = response.send(result);
+                        }
+                        TclCommand::ListTools { namespace, filter, response } => {
+                            let tools = executor.list_tools(namespace, filter);
+                            let _ = response.send(Ok(tools));
+                        }
+                        TclCommand::ExecuteCustomTool { path, params, response } => {
+                            let result = executor.execute_custom_tool(&path, params);
+                            let _ = response.send(result);
+                        }
+                        TclCommand::GetToolDefinitions { response } => {
+                            let tools = executor.get_tool_definitions();
+                            let _ = response.send(tools);
+                        }
+                        TclCommand::InitializePersistence { response } => {
+                            let result = executor.initialize_persistence().await;
+                            let _ = response.send(result);
+                        }
+                        TclCommand::ExecTool { tool_path, params, response } => {
+                            let result = executor.exec_tool(&tool_path, params).await;
+                            let _ = response.send(result);
+                        }
+                        TclCommand::DiscoverTools { response } => {
+                            let result = executor.discover_tools().await;
+                            let _ = response.send(result);
+                        }
+                    }
+                }
+            });
+        });
+        
+        Ok(tx_clone)
+    }
+    
     fn execute_script(&mut self, script: &str) -> Result<String> {
-        match self.interp.eval(script) {
-            Ok(value) => Ok(value.to_string()),
-            Err(error) => Err(anyhow!("TCL execution error: {:?}", error)),
-        }
+        self.runtime.eval(script)
     }
     
     async fn add_tool(&mut self, path: ToolPath, description: String, script: String, parameters: Vec<ParameterDefinition>) -> Result<String> {
@@ -312,27 +399,23 @@ impl TclExecutor {
             .ok_or_else(|| anyhow!("Tool '{}' not found", path))?
             .clone();
         
-        let mut script = String::new();
-        
         // Set parameters as TCL variables
         if let Some(params_obj) = params.as_object() {
             for param_def in &tool.parameters {
                 if let Some(value) = params_obj.get(&param_def.name) {
                     let tcl_value = match value {
-                        serde_json::Value::String(s) => format!("\"{}\"", s.replace("\"", "\\\"")),
+                        serde_json::Value::String(s) => s.to_string(),
                         _ => value.to_string(),
                     };
-                    script.push_str(&format!("set {} {}\n", param_def.name, tcl_value));
+                    self.runtime.set_var(&param_def.name, &tcl_value)?;
                 } else if param_def.required {
                     return Err(anyhow!("Missing required parameter: {}", param_def.name));
                 }
             }
         }
         
-        // Append the tool script
-        script.push_str(&tool.script);
-        
-        self.execute_script(&script)
+        // Execute the tool script
+        self.execute_script(&tool.script)
     }
     
     fn get_tool_definitions(&self) -> Vec<ToolDefinition> {
@@ -395,41 +478,8 @@ impl TclExecutor {
         let path = ToolPath::parse(tool_path)?;
         
         // Check custom tools first (added via tcl_tool_add)
-        if let Some(custom_tool) = self.custom_tools.get(&path) {
-            // Create a script with parameter bindings
-            let mut full_script = String::new();
-            
-            // Set parameters as TCL variables
-            if let Some(params_obj) = params.as_object() {
-                for param_def in &custom_tool.parameters {
-                    if let Some(value) = params_obj.get(&param_def.name) {
-                        let tcl_value = match value {
-                            serde_json::Value::String(s) => format!("\"{}\"", s.replace("\"", "\\\"")),
-                            _ => value.to_string(),
-                        };
-                        full_script.push_str(&format!("set {} {}\n", param_def.name, tcl_value));
-                    } else if param_def.required {
-                        return Err(anyhow!("Missing required parameter: {}", param_def.name));
-                    }
-                }
-            }
-            
-            // Make params available as an array for the script
-            full_script.push_str("array set params {}\n");
-            if let Some(params_obj) = params.as_object() {
-                for (key, value) in params_obj {
-                    let tcl_value = match value {
-                        serde_json::Value::String(s) => format!("\"{}\"", s.replace("\"", "\\\"")),
-                        _ => value.to_string(),
-                    };
-                    full_script.push_str(&format!("set params({}) {}\n", key, tcl_value));
-                }
-            }
-            
-            // Append the tool script
-            full_script.push_str(&custom_tool.script);
-            
-            return self.execute_script(&full_script);
+        if self.custom_tools.contains_key(&path) {
+            return self.execute_custom_tool(&path, params);
         }
         
         // Check if it's a discovered tool
@@ -437,28 +487,23 @@ impl TclExecutor {
             // Read and execute the tool file
             let script_content = tokio::fs::read_to_string(&discovered_tool.file_path).await?;
             
-            // Create a script with parameter bindings
-            let mut full_script = String::new();
-            
             // Set parameters as TCL variables
             if let Some(params_obj) = params.as_object() {
                 for param_def in &discovered_tool.parameters {
                     if let Some(value) = params_obj.get(&param_def.name) {
                         let tcl_value = match value {
-                            serde_json::Value::String(s) => format!("\"{}\"", s.replace("\"", "\\\"")),
+                            serde_json::Value::String(s) => s.to_string(),
                             _ => value.to_string(),
                         };
-                        full_script.push_str(&format!("set {} {}\n", param_def.name, tcl_value));
+                        self.runtime.set_var(&param_def.name, &tcl_value)?;
                     } else if param_def.required {
                         return Err(anyhow!("Missing required parameter: {}", param_def.name));
                     }
                 }
             }
             
-            // Append the tool script
-            full_script.push_str(&script_content);
-            
-            return self.execute_script(&full_script);
+            // Execute the tool script
+            return self.execute_script(&script_content);
         }
         
         // Check if it's a custom tool
