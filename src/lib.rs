@@ -6,3 +6,5 @@ pub mod tcl_executor;
 pub mod persistence;
 pub mod tool_discovery;
 pub mod capabilities;
+pub mod http_server;
+pub mod auth;

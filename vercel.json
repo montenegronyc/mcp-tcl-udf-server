@@ -1,0 +1,21 @@
+{
+  "version": 2,
+  "functions": {
+    "api/index.rs": {
+      "runtime": "vercel-rust@4.0.0"
+    }
+  },
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "/api/index"
+    }
+  ],
+  "env": {
+    "TCL_MCP_RUNTIME": "molt",
+    "RUST_LOG": "info",
+    "TCL_MCP_PRIVILEGED": "false",
+    "TCL_MCP_API_KEY": "@tcl_mcp_api_key",
+    "TCL_MCP_REQUIRE_AUTH": "true"
+  }
+}

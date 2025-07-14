@@ -31,6 +31,21 @@ schemars = "0.8"
 # Async runtime (still needed by rmcp)
 tokio = { version = "1.0", features = ["full"] }
 
+# HTTP server support
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+hyper = "1.0"
+
+# Vercel runtime support
+vercel-runtime = "1.0"
+http = "1.0"
+
+# Authentication
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.8"
+
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -70,3 +85,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "tcl-mcp-server"
 path = "src/main.rs"
+
+[[bin]]
+name = "tcl-mcp-server-http"
+path = "src/main_http.rs"
