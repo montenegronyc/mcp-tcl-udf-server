@@ -17,7 +17,7 @@ async fn handler(req: Request) -> Result<Response<Body>, Error> {
         "version": "1.0.0",
         "path": path,
         "method": method.to_string(),
-        "message": "Vercel function is working"
+        "message": "Vercel function is working - updated"
     });
     
     Response::builder()
