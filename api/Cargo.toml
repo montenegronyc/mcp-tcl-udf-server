@@ -1,0 +1,16 @@
+[package]
+name = "vercel-function"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vercel-runtime = "1.0"
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# For the full implementation (commented out for now)
+# tcl-mcp-server = { path = ".." }
+# axum = "0.7"
+# tower = "0.4"
